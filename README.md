@@ -54,3 +54,7 @@ Run exactly one machine. If two copies poll Telegram with the same token, Telegr
 - After the recent-member window ends, the bot stops checking that person's messages.
 - A bio is cached for 5 minutes, so the bot might not catch a link that's added in the middle of a conversation right away.
 - The bot must be an admin. Otherwise Telegram doesn't send it member updates.
+
+## License
+
+[MIT](LICENSE)
