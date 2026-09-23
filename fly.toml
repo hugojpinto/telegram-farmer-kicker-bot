@@ -1,0 +1,22 @@
+# Change this to a unique name (Fly app names are global).
+app = "telegram-kicker"
+primary_region = "ams"
+
+[build]
+
+[env]
+  DB_PATH = "/data/members.db"
+  ACTION = "ban"
+  NEW_MEMBER_DAYS = "14"
+
+# Keeps members.db across restarts and deploys.
+[mounts]
+  source = "kicker_data"
+  destination = "/data"
+
+# No [http_service]: the bot polls Telegram and doesn't accept incoming traffic,
+# so Fly never auto-stops it.
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

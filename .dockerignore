@@ -1,0 +1,4 @@
+.venv/
+.env
+members.db
+__pycache__/
