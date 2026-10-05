@@ -1,12 +1,14 @@
 """Telegram bot that removes new members whose bio contains a Telegram link.
 
-Add the bot as an administrator (with "Ban users" / "Add members" rights) to a
-group or channel. It watches for new members and join requests, fetches each
+Add the bot as an administrator (with "Ban users" / "Add members" and "Delete
+messages" rights) to a group or channel. It watches for new members and join requests, fetches each
 user's bio and removes anyone whose bio links to Telegram. Members who joined
-recently are checked again whenever they send a message, which catches people
-who add the link after joining.
+recently are checked again a few minutes after joining, whenever they send a
+message, and in a sweep of all recent members that runs while the chat is
+active. That catches people who add the link after joining.
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -44,6 +46,10 @@ NEW_MEMBER_DAYS = float(os.getenv("NEW_MEMBER_DAYS", "14"))
 DB_PATH = os.getenv("DB_PATH", "members.db")
 # Bios are cached briefly so a chatty user doesn't trigger a getChat call on every message.
 BIO_CACHE_SECONDS = 300
+# New members get a second bio check this long after joining.
+JOIN_RECHECK_SECONDS = 360
+# While a chat is active, all of its recent members are re-checked at most this often.
+SWEEP_INTERVAL_SECONDS = 600
 
 LINK_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/\S+"
@@ -87,6 +93,14 @@ def is_new_member(chat_id: int, user_id: int) -> bool:
     return row is not None and time.time() - row[0] < NEW_MEMBER_DAYS * 86400
 
 
+def recent_members(chat_id: int) -> list[int]:
+    rows = db.execute(
+        "SELECT user_id FROM joins WHERE chat_id = ? AND joined_at >= ?",
+        (chat_id, time.time() - NEW_MEMBER_DAYS * 86400),
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
 def prune_old_joins() -> None:
     db.execute("DELETE FROM joins WHERE joined_at < ?", (time.time() - NEW_MEMBER_DAYS * 86400,))
     db.commit()
@@ -95,6 +109,8 @@ def prune_old_joins() -> None:
 bio_cache: dict[int, tuple[float, str | None]] = {}
 # Discussion group id -> id of the channel it's linked to (None if it isn't linked).
 linked_channels: dict[int, int | None] = {}
+# Chat id -> when its recent members were last swept.
+last_sweep: dict[int, float] = {}
 
 
 async def linked_channel(context: ContextTypes.DEFAULT_TYPE, group_id: int) -> int | None:
@@ -154,8 +170,12 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     bio = await fetch_bio(context, user.id)
+    log.info("%s (%s) joined %r (%s). Bio: %r", user.full_name, user.id, chat.title, chat.id, bio)
     if not has_telegram_link(bio):
         record_join(chat.id, user.id)
+        context.job_queue.run_once(
+            recheck_join, JOIN_RECHECK_SECONDS, data=(chat.id, chat.title, user.id, user.full_name)
+        )
         return
 
     try:
@@ -168,18 +188,67 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         log.error("Failed to remove %s from %s: %s", user.id, chat.id, e)
 
 
+async def recheck_join(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Checks a new member's bio a second time, shortly after they joined."""
+    chat_id, chat_title, user_id, full_name = context.job.data
+    if not is_new_member(chat_id, user_id):
+        return
+    bio = await fetch_bio(context, user_id)
+    if not has_telegram_link(bio):
+        return
+    try:
+        await remove_user(context, chat_id, user_id)
+        log.info(
+            "Removed %s (%s) from %r (%s) on the re-check after joining. Bio: %r",
+            full_name, user_id, chat_title, chat_id, bio,
+        )
+    except TelegramError as e:
+        log.error("Failed to remove %s from %s: %s", user_id, chat_id, e)
+
+
+async def sweep_recent_members(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Re-checks the bio of everyone who joined the chat recently."""
+    try:
+        for user_id in recent_members(chat_id):
+            bio = await fetch_bio(context, user_id, use_cache=True)
+            if has_telegram_link(bio):
+                try:
+                    await remove_user(context, chat_id, user_id)
+                    log.info("Removed recent member %s from %s in a sweep. Bio: %r", user_id, chat_id, bio)
+                except TelegramError as e:
+                    log.error("Failed to remove %s from %s: %s", user_id, chat_id, e)
+            # Spread the getChat calls out to stay clear of Telegram's rate limits.
+            await asyncio.sleep(0.1)
+    finally:
+        last_sweep[chat_id] = time.time()
+
+
+def maybe_sweep(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    if time.time() - last_sweep.get(chat_id, 0) < SWEEP_INTERVAL_SECONDS:
+        return
+    last_sweep[chat_id] = time.time()
+    # Runs in the background so a long sweep doesn't hold up other updates.
+    context.application.create_task(sweep_recent_members(context, chat_id))
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Re-checks the bio of recently joined members when they post, in case they added a link after joining.
 
     Channel subscribers can only write as comments in the channel's discussion group,
-    so for those the join date in the linked channel counts too.
+    so for those the join date in the linked channel counts too. Any message also
+    triggers a sweep of the other recent members, at most once per SWEEP_INTERVAL_SECONDS.
     """
     msg = update.effective_message
     user = update.effective_user
     chat = update.effective_chat
-    if not msg or not user or user.is_bot:
+    if not msg:
         return
-    new_in = [cid for cid in (chat.id, await linked_channel(context, chat.id)) if cid and is_new_member(cid, user.id)]
+    chat_ids = [cid for cid in (chat.id, await linked_channel(context, chat.id)) if cid]
+    for cid in chat_ids:
+        maybe_sweep(context, cid)
+    if not user or user.is_bot:
+        return
+    new_in = [cid for cid in chat_ids if is_new_member(cid, user.id)]
     if not new_in:
         return
 
@@ -233,6 +302,8 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     log.info("Bot status in %r (%s, %s) is now: %s", cmu.chat.title, cmu.chat.id, cmu.chat.type, status)
     if status != ChatMember.ADMINISTRATOR and cmu.chat.type != ChatType.PRIVATE:
         log.warning("The bot must be an administrator in %r to see and remove new members.", cmu.chat.title)
+    elif status == ChatMember.ADMINISTRATOR and not cmu.new_chat_member.can_delete_messages:
+        log.warning("The bot needs the 'Delete messages' right in %r to remove offending posts.", cmu.chat.title)
 
 
 def main() -> None:

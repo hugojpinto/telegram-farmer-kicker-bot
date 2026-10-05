@@ -15,7 +15,7 @@ A Telegram bot that removes new members of a group or channel when their bio con
    ```sh
    .venv/bin/python bot.py
    ```
-4. Add the bot to your group or channel and **make it an administrator** with the **Ban users** permission. In a channel, that permission is listed under the admin rights for adding and removing subscribers.
+4. Add the bot to your group or channel and **make it an administrator** with the **Ban users** and **Delete messages** permissions. Without **Delete messages**, the bot still removes spammers but leaves their posts behind. In a channel, that permission is listed under the admin rights for adding and removing subscribers.
 
 ## Deploy to Fly.io
 
@@ -34,7 +34,9 @@ Run exactly one machine. If two copies poll Telegram with the same token, Telegr
 ## How it works
 
 - **New members**: when someone joins, the bot fetches their bio. If the bio has a Telegram link, the bot removes them.
+- **Recheck after joining**: six minutes after someone joins, the bot checks their bio a second time.
 - **Recent members who post**: the bot records when each member joins. For the first 14 days after someone joins, the bot checks their bio each time they send a message. If a link has appeared, it deletes the message and removes them. In a channel, this covers comments in the linked discussion group. The bot must be an admin there too.
+- **Sweep of recent members**: while a chat is active, the bot also re-checks the bios of everyone who joined it in the last 14 days, at most once every 10 minutes. Any message in the chat (or in a channel's discussion group) triggers the sweep, so a quiet chat isn't swept.
 - **Join requests**: if the chat requires admin approval, the bot declines requests from users with a link in their bio. It leaves every other request for a human admin to handle.
 
 ## Configuration (`.env`)
@@ -44,14 +46,14 @@ Run exactly one machine. If two copies poll Telegram with the same token, Telegr
 | `BOT_TOKEN`      | —       | Token from BotFather                                         |
 | `ACTION`         | `kick`  | `kick` removes the user but lets them rejoin; `ban` blocks them permanently |
 | `MATCH_MENTIONS` | `false` | Also treat bare `@username` mentions as links                |
-| `NEW_MEMBER_DAYS`| `14`    | How long after joining a member's messages are still checked |
+| `NEW_MEMBER_DAYS`| `14`    | How long after joining a member's bio is still re-checked     |
 | `DB_PATH`        | `members.db` | SQLite file where join dates are stored                 |
 
 ## Limitations
 
 - Users can hide their bio with Telegram's privacy settings. The bot can't see a hidden bio, so it lets that user stay.
 - Telegram doesn't tell bots when someone joined, so the bot records join dates itself. It won't recheck people who joined before it started running.
-- After the recent-member window ends, the bot stops checking that person's messages.
+- After the recent-member window ends, the bot stops checking that person.
 - A bio is cached for 5 minutes, so the bot might not catch a link that's added in the middle of a conversation right away.
 - The bot must be an admin. Otherwise Telegram doesn't send it member updates.
 
